@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101214">
+<title>Bay State Road Trip</title>
+<style>
+:root{--bg:#101214;--panel:#1a1e21;--line:#2c3237;--text:#f2f4f5;--dim:#98a2a9;--sign:#0b6b45;--amber:#ffb020;--bad:#ff6b5e}
+*{box-sizing:border-box;margin:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+ padding:env(safe-area-inset-top,0) 14px env(safe-area-inset-bottom,0);display:flex;flex-direction:column;gap:12px;overflow-x:hidden}
+header{display:flex;justify-content:space-between;align-items:center;padding-top:12px;color:var(--dim);font-size:15px}
+#status{display:flex;align-items:center;gap:8px}
+#dot{width:12px;height:12px;border-radius:50%;background:var(--dim)}
+#dot.live{background:var(--amber);box-shadow:0 0 10px var(--amber)}
+#dot.err{background:var(--bad)}
+.sign{background:var(--sign);border:4px solid #fff;border-radius:14px;padding:18px 16px;outline:3px solid var(--sign);outline-offset:3px}
+.sign small{display:block;font-size:16px;opacity:.85;margin-bottom:4px}
+#town{font-size:clamp(40px,13vw,84px);font-weight:800;line-height:1.02;letter-spacing:-.02em;overflow-wrap:anywhere}
+#trivia{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;font-size:clamp(20px,5.2vw,28px);line-height:1.4;min-height:120px}
+#trivia.dim{color:var(--dim)}
+#trivia{white-space:pre-line}
+.row{display:flex;gap:10px}
+button{font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;font-size:18px;font-weight:600;cursor:pointer;flex:1;min-height:56px}
+button:active{transform:scale(.98)}
+#go{background:var(--amber);color:#1a1200;border:0;font-size:clamp(22px,6vw,30px);font-weight:800;min-height:84px;width:100%;flex:none}
+#go.on{background:var(--panel);color:var(--amber);border:2px solid var(--amber)}
+:focus-visible{outline:3px solid #fff;outline-offset:2px}
+h2{font-size:17px;font-weight:600;color:var(--dim);display:flex;justify-content:space-between}
+#log{list-style:none;padding:0;display:flex;flex-direction:column;gap:6px;flex:1;min-height:120px;overflow-y:auto;padding-bottom:14px}
+#log li{background:var(--panel);border-left:5px solid var(--sign);border-radius:8px;padding:10px 12px;display:flex;justify-content:space-between;gap:10px;font-size:18px}
+#log time{color:var(--dim);font-size:15px;white-space:nowrap;text-align:right}
+#empty{color:var(--dim);font-size:17px;padding:6px 2px}
+@media (prefers-reduced-motion:no-preference){#dot.live{animation:p 1.6s infinite}@keyframes p{50%{opacity:.35}}}
+</style>
+</head>
+<body>
+<header>
+  <div id="status"><span id="dot"></span><span id="stxt">Tracker off</span></div>
+  <span id="gps">–</span>
+</header>
+
+<section class="sign" aria-live="polite">
+  <small id="lead">Waiting for GPS</small>
+  <div id="town">Massachusetts</div>
+</section>
+
+<div id="trivia" class="dim">Tap Engage Travel Tracker to start. Keep this screen open while driving.</div>
+
+<div class="row">
+  <button id="replay" disabled>Replay</button>
+  <button id="mute" aria-pressed="false">Voice on</button>
+</div>
+
+<button id="go">Engage Travel Tracker</button>
+
+<h2><span>Towns crossed</span><span id="count">0</span></h2>
+<ul id="log"></ul>
+<p id="empty">No towns yet. Your trip log will appear here.</p>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const MOVE_M = 250;          // re-query geocoder only after moving this far
+  const MIN_GAP_MS = 5000;     // stay well under Nominatim's 1 req/sec policy
+  const CONFIRM = 2;           // consecutive hits before announcing (avoids border flicker)
+
+  let watchId = null, wakeLock = null, muted = false;
+  let lastGeo = null, lastGeoAt = 0, geoBusy = false;
+  let currentTown = null, candidate = null, candidateHits = 0;
+  let lastSpeech = '';
+  const geoCache = new Map();   // rounded coords -> town result
+  const triviaCache = new Map();// town -> summary text
+  let history = [];
+
+  try { history = JSON.parse(localStorage.getItem('mass-trip-log') || '[]'); } catch (e) {}
+
+  const dist = (a, b) => {
+    const R = 6371000, r = x => x * Math.PI / 180;
+    const dLat = r(b.lat - a.lat), dLon = r(b.lon - a.lon);
+    const h = Math.sin(dLat/2)**2 + Math.cos(r(a.lat)) * Math.cos(r(b.lat)) * Math.sin(dLon/2)**2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  };
+
+  function setStatus(txt, cls) {
+    $('stxt').textContent = txt;
+    $('dot').className = cls || '';
+  }
+
+  /* ---------- Voice ---------- */
+  function speak(text) {
+    lastSpeech = text;
+    $('replay').disabled = false;
+    if (muted || !('speechSynthesis' in window)) return;
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'en-US'; u.rate = 0.95;
+    const v = speechSynthesis.getVoices().find(v => v.lang === 'en-US') || null;
+    if (v) u.voice = v;
+    speechSynthesis.speak(u);
+  }
+  function unlockAudio() {
+    if (!('speechSynthesis' in window)) return;
+    const u = new SpeechSynthesisUtterance(' ');
+    u.volume = 0;
+    speechSynthesis.speak(u);
+  }
+
+  /* ---------- Geocoding ---------- */
+  async function reverse(lat, lon) {
+    const key = lat.toFixed(3) + ',' + lon.toFixed(3);
+    if (geoCache.has(key)) return geoCache.get(key);
+    const url = 'https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=12&addressdetails=1&accept-language=en'
+      + `&lat=${lat}&lon=${lon}`;
+    const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+    if (!res.ok) throw new Error('Geocoder ' + res.status);
+    const a = (await res.json()).address || {};
+    const out = {
+      state: a.state || '',
+      town: a.city || a.town || a.village || a.municipality || a.hamlet || ''
+    };
+    geoCache.set(key, out);
+    return out;
+  }
+
+  /* ---------- Trivia ---------- */
+  const firstSentences = (t, n = 2) => {
+    const clean = t.replace(/\s*\([^)]*\)/g, '').replace(/\s+/g, ' ').trim();
+    const parts = clean.match(/[^.!?]+[.!?]+(?=\s|$)/g) || [clean];
+    return parts.slice(0, n).join(' ').trim();
+  };
+  async function summary(title) {
+    const r = await fetch('https://en.wikipedia.org/api/rest_v1/page/summary/' + encodeURIComponent(title.replace(/ /g, '_')),
+      { headers: { 'Accept': 'application/json' } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (j.type === 'disambiguation' || !j.extract) return null;
+    return firstSentences(j.extract);
+  }
+  const BORING = /population|census|square mile|sq mi|km2|\bkm\b|county seat|per square|median|household|density|racial|demograph|latitude|\bzip\b|area code|miles? \(|located|borders?|bordered|situated|\bmi\b|elevation|[Ss]elect ?board|town meeting|mayor|school district/;
+  const GOOD = /known for|famous|famed|first|oldest|largest|only|home to|birthplace|born|founded|settled|incorporated|named (for|after)|historic|site of|battle|revolution|witch|whaling|colonial|invent|museum|festival|annual|park|lake|beach|cranberr|college|universit|cape|island|lighthouse|harbor|mill|factory|railroad|poet|author|president|notable|landmark/i;
+
+  function nameStory(full) {
+    const clean = t => t.replace(/\s*\([^)]*\)/g, '').replace(/\s+/g, ' ').trim();
+    const sents = t => (clean(t).match(/[^.!?]+[.!?]+(?=\s|$)/g) || []).map(x => x.trim());
+    const sec = full.match(/==+\s*(?:Etymology|Name|Naming|Origin of (?:the )?name|Name origin)[^=\n]*==+\n([\s\S]*?)(?=\n==|$)/i);
+    let out = sec ? sents(sec[1]).filter(x => x.length >= 30 && x.length < 320).slice(0, 2) : [];
+    if (!out.length) {
+      const re = /named (?:for|after|in honou?r of)|takes? its name|derives? its name|derived its name|name (?:comes|came|derives|derived|originates|originated)|origin of the name|so named|set off from|separated from|split from|broke away from/i;
+      out = sents(full.replace(/==+[^=\n]+==+/g, ' ').slice(0, 15000)).filter(x => re.test(x) && x.length < 300).slice(0, 2);
+    }
+    return out.length ? 'About its name: ' + out.join(' ') : '';
+  }
+
+  function sectionLines(full, names) {
+    const re = new RegExp('(?:^|\\n)==\\s*(?:' + names + ')[^=\\n]*==\\s*\\n([\\s\\S]*?)(?=\\n==[^=]|$)', 'i');
+    const m = full.match(re);
+    if (!m) return [];
+    return m[1].split('\n').map(l => l.replace(/\s*\([^)]*\)/g, '').trim())
+      .filter(l => l.length > 12 && l.length < 300 && !/^=+/.test(l));
+  }
+  const trim = (t, n) => {
+    if (t.length <= n) return t.replace(/[,;:\s]+$/, '');
+    return t.slice(0, n).replace(/\s+\S*$/, '').replace(/[,;:\s]+$/, '');
+  };
+  function peopleStory(full) {
+    const lines = sectionLines(full, 'Notable|Famous|Residents|People');
+    if (!lines.length) return '';
+    const W = /author|writer|poet|novelist|essayist|playwright|journalist|philosopher|historian|biographer|pulitzer/i;
+    const F = /president|governor|senator|astronaut|actor|actress|inventor|olympic|nobel|musician|singer|artist|composer|nfl|mlb|nba|nhl|player|comedian|director|scientist|general/i;
+    const picked = lines.map((l, i) => ({ l, i, sc: (W.test(l) ? 3 : 0) + (F.test(l) ? 2 : 0) }))
+      .filter(x => x.sc > 0).sort((a, b) => b.sc - a.sc || a.i - b.i).slice(0, 3)
+      .sort((a, b) => a.i - b.i).map(x => trim(x.l.split(';')[0], 90));
+    return picked.length ? 'Famous people from here include ' + picked.join('; ') + '.' : '';
+  }
+  function booksStory(full) {
+    const KEY = /novel|book|story|stories|poem|film|movie|series|show|set in|takes place|filmed/i;
+    let out = sectionLines(full, 'In popular culture|Popular culture|In fiction|In literature|Literature|In film[^=\\n]*|In media|In the media|Cultural references|In the arts')
+      .filter(l => KEY.test(l)).slice(0, 2).map(l => trim(l.split(/(?<=\.)\s/)[0], 200));
+    if (!out.length) {
+      const re = /(novel|book|story|film|movie|television|series|poem)[^.]{0,90}(set in|takes place in|is set|are set|filmed in|was filmed|were filmed|based in)/i;
+      const flat = full.replace(/==+[^=\n]+==+/g, ' ').replace(/\s*\([^)]*\)/g, '').replace(/\s+/g, ' ');
+      out = (flat.slice(0, 20000).match(/[^.!?]+[.!?]+(?=\s|$)/g) || []).map(x => x.trim())
+        .filter(x => re.test(x) && x.length < 260).slice(0, 2);
+    }
+    return out.length ? 'In books and on screen: ' + out.join(' ') : '';
+  }
+
+  async function wikidataPeople(qid) {
+    const q = `SELECT ?pLabel ?pDescription ?s WHERE {
+  { ?p wdt:P19 wd:${qid} } UNION { ?p wdt:P551 wd:${qid} }
+  ?p wdt:P31 wd:Q5; wikibase:sitelinks ?s.
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+} ORDER BY DESC(?s) LIMIT 8`;
+    const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 8000);
+    try {
+      const r = await fetch('https://query.wikidata.org/sparql?format=json&query=' + encodeURIComponent(q),
+        { signal: ctl.signal, headers: { 'Accept': 'application/sparql-results+json' } });
+      if (!r.ok) return '';
+      const seen = new Set(), out = [];
+      for (const b of (await r.json()).results.bindings) {
+        const name = b.pLabel && b.pLabel.value;
+        if (!name || /^Q\d+$/.test(name) || seen.has(name) || +b.s.value < 8) continue;
+        seen.add(name);
+        const d = b.pDescription ? trim(b.pDescription.value, 60) : '';
+        out.push(d ? `${name}, ${d}` : name);
+        if (out.length >= 4) break;
+      }
+      return out.length ? 'Famous people who were born or lived here include ' + out.join('; ') + '.' : '';
+    } finally { clearTimeout(timer); }
+  }
+
+  function pickFacts(full, skip) {
+    const text = full.replace(/\s*\([^)]*\)/g, '').replace(/==+[^=]+==+/g, ' ').replace(/\s+/g, ' ');
+    const sentences = (text.slice(0, 12000).match(/[^.!?]+[.!?]+(?=\s|$)/g) || []).map(s => s.trim());
+    const scored = [];
+    sentences.forEach((s, i) => {
+      if (i < 1 || s.length < 50 || s.length > 240 || BORING.test(s) || (skip && skip.includes(s))) return;
+      const hits = (s.match(new RegExp(GOOD.source, 'gi')) || []).length;
+      if (hits) scored.push({ s, i, score: hits });
+    });
+    if (!scored.length) return null;
+    scored.sort((a, b) => b.score - a.score || a.i - b.i);
+    const KNOWN = /known for|known as|famous|famed|home to|nicknamed/i;
+    const picks = [];
+    const near = x => picks.some(p => Math.abs(p.i - x.i) <= 2);
+    const known = scored.find(x => KNOWN.test(x.s));
+    if (known) picks.push(known);
+    for (const x of scored) { if (picks.length >= 3) break; if (!picks.includes(x) && !near(x)) picks.push(x); }
+    return picks.sort((a, b) => a.i - b.i).map(p => p.s).join(' ');
+  }
+  const BOSTON = { lat: 42.3601, lon: -71.0589 };
+  async function articleFacts(title, town) {
+    const u = 'https://en.wikipedia.org/w/api.php?action=query&prop=extracts%7Ccoordinates%7Cpageprops&ppprop=wikibase_item&explaintext=1&redirects=1&format=json&origin=*&titles='
+      + encodeURIComponent(title);
+    const r = await fetch(u);
+    if (!r.ok) return null;
+    const p = Object.values((await r.json()).query.pages)[0];
+    if (!p || !p.extract || !/Massachusetts/.test(p.extract)) return null;
+    const m = p.extract.match(/population (?:was|of|is) ([\d,]{3,})/i);
+    const c = (p.coordinates && p.coordinates[0]) || lastGeo;
+    const mi = c && town !== 'Boston' ? Math.round(dist({ lat: c.lat, lon: c.lon }, BOSTON) / 1609.34) : null;
+    const pop = m ? 'a population of ' + m[1] : '';
+    const far = mi ? 'about ' + mi + ' miles from Boston' : '';
+    const stats = pop && far ? `It has ${pop} and sits ${far}.` : pop ? `It has ${pop}.` : far ? `It sits ${far}.` : '';
+    const name = nameStory(p.extract);
+    const qid = p.pageprops && p.pageprops.wikibase_item;
+    const people = (qid && await wikidataPeople(qid).catch(() => '')) || peopleStory(p.extract), books = booksStory(p.extract);
+    return { stats, name, people, books, facts: pickFacts(p.extract, [name, people, books].join(' ')) };
+  }
+
+  /* Nearby landmarks, stores and food from OpenStreetMap (Overpass, free) */
+  const joinList = a => a.length < 2 ? a.join('') : a.slice(0, -1).join(', ') + ' and ' + a[a.length - 1];
+  async function nearbyPlaces() {
+    if (!lastGeo) return '';
+    const { lat, lon } = lastGeo;
+    const q = `[out:json][timeout:12];(
+nwr(around:2500,${lat},${lon})["tourism"~"^(attraction|museum|viewpoint|zoo|theme_park|gallery)$"]["name"];
+nwr(around:2500,${lat},${lon})["historic"~"^(monument|memorial|castle|fort|ruins|building|battlefield|ship)$"]["name"];
+nwr(around:2000,${lat},${lon})["shop"~"^(mall|department_store|supermarket)$"]["name"];
+nwr(around:1500,${lat},${lon})["amenity"~"^(restaurant|cafe)$"]["name"];
+);out tags center 120;`;
+    const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 9000);
+    try {
+      const r = await fetch('https://overpass-api.de/api/interpreter', {
+        method: 'POST', signal: ctl.signal,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'data=' + encodeURIComponent(q)
+      });
+      if (!r.ok) return '';
+      const groups = { land: [], shop: [], food: [] }, seen = new Set();
+      for (const e of (await r.json()).elements || []) {
+        const t = e.tags || {}, name = (t.name || '').trim();
+        if (!name || name.length > 40 || seen.has(name.toLowerCase())) continue;
+        seen.add(name.toLowerCase());
+        const score = (t.wikidata || t.wikipedia ? 3 : 0) + (t.brand ? 2 : 0) + (t.website ? 1 : 0) + (t.cuisine ? 1 : 0);
+        const g = t.tourism || t.historic ? 'land' : t.shop ? 'shop' : 'food';
+        groups[g].push({ name, score });
+      }
+      const top = (g, n) => groups[g].sort((a, b) => b.score - a.score).slice(0, n).map(x => x.name);
+      const out = [];
+      const land = top('land', 2), shop = top('shop', 2), food = top('food', 3);
+      if (land.length) out.push(`Nearby landmarks include ${joinList(land)}.`);
+      if (shop.length) out.push(`For shopping, there's ${joinList(shop)}.`);
+      if (food.length) out.push(`For a bite, try ${joinList(food)}.`);
+      return out.join(' ');
+    } finally { clearTimeout(timer); }
+  }
+
+  async function trivia(town) {
+    if (triviaCache.has(town)) return triviaCache.get(town);
+    const nearP = nearbyPlaces().catch(() => '');
+    let text = null, stats = '', name = '', people = '', books = '', facts = null;
+    for (const t of [`${town}, Massachusetts`, town]) {
+      try { const r = await articleFacts(t, town); if (r && (r.stats || r.facts)) { stats = r.stats; name = r.name; people = r.people; books = r.books; facts = r.facts; break; } } catch (e) {}
+    }
+    if (!facts) { try { facts = await summary(`${town}, Massachusetts`) || await summary(town); } catch (e) {} }
+    text = [stats, name, people, books, facts, await nearP].filter(Boolean).join('\n') || null;
+    text = text || 'No fun fact found for this town yet.';
+    triviaCache.set(town, text);
+    return text;
+  }
+
+  /* ---------- Town change ---------- */
+  const fmtTime = d => d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' });
+
+  function renderLog() {
+    const ul = $('log'); ul.textContent = '';
+    history.slice().reverse().forEach(h => {
+      const li = document.createElement('li');
+      const n = document.createElement('span'); n.textContent = h.town;
+      const t = document.createElement('time'); t.dateTime = h.iso; t.textContent = fmtTime(new Date(h.iso));
+      li.append(n, t); ul.append(li);
+    });
+    $('count').textContent = history.length;
+    $('empty').style.display = history.length ? 'none' : 'block';
+  }
+  function logTown(town) {
+    history.push({ town, iso: new Date().toISOString() });
+    try { localStorage.setItem('mass-trip-log', JSON.stringify(history)); } catch (e) {}
+    renderLog();
+  }
+
+  async function enterTown(town) {
+    currentTown = town;
+    $('lead').textContent = 'Welcome to';
+    $('town').textContent = town;
+    $('trivia').className = ''; $('trivia').textContent = 'Looking up what makes ' + town + ' special…';
+    logTown(town);
+    const fact = await trivia(town);
+    if (currentTown !== town) return; // moved on while loading
+    $('trivia').textContent = fact;
+    speak(`Welcome to ${town}. ${fact}`);
+  }
+
+  async function handleTown(r) {
+    if (!/massachusetts/i.test(r.state) || !r.town) {
+      $('lead').textContent = r.state ? 'Currently in' : 'Location unknown';
+      $('town').textContent = r.state || '–';
+      return;
+    }
+    if (r.town === currentTown) { candidate = null; candidateHits = 0; return; }
+    if (r.town === candidate) candidateHits++; else { candidate = r.town; candidateHits = 1; }
+    if (!currentTown || candidateHits >= CONFIRM) { candidate = null; candidateHits = 0; await enterTown(r.town); }
+  }
+
+  /* ---------- GPS ---------- */
+  async function onPos(p) {
+    const { latitude: lat, longitude: lon, accuracy, speed } = p.coords;
+    const mph = speed != null ? Math.round(speed * 2.237) + ' mph · ' : '';
+    $('gps').textContent = `${mph}±${Math.round(accuracy)} m`;
+    setStatus('Tracking live', 'live');
+
+    const here = { lat, lon };
+    const moved = !lastGeo || dist(lastGeo, here) >= MOVE_M;
+    const waited = Date.now() - lastGeoAt >= MIN_GAP_MS;
+    if (!moved || !waited || geoBusy) return;
+
+    geoBusy = true; lastGeoAt = Date.now();
+    try {
+      const r = await reverse(lat, lon);
+      lastGeo = here;
+      await handleTown(r);
+    } catch (e) {
+      setStatus('Lookup failed, retrying', 'err');
+    } finally { geoBusy = false; }
+  }
+  function onErr(e) {
+    const msg = e.code === 1 ? 'Location permission denied' : e.code === 2 ? 'GPS signal unavailable' : 'GPS timed out';
+    setStatus(msg, 'err');
+    if (e.code === 1) stop();
+  }
+
+  async function keepAwake() {
+    try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  }
+  function start() {
+    if (!('geolocation' in navigator)) { setStatus('Geolocation not supported', 'err'); return; }
+    unlockAudio();
+    keepAwake();
+    $('go').textContent = 'Stop tracking'; $('go').classList.add('on');
+    $('lead').textContent = 'Finding your position';
+    setStatus('Acquiring GPS…');
+    watchId = navigator.geolocation.watchPosition(onPos, onErr,
+      { enableHighAccuracy: true, maximumAge: 2000, timeout: 20000 });
+  }
+  function stop() {
+    if (watchId != null) navigator.geolocation.clearWatch(watchId);
+    watchId = null;
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+    speechSynthesis.cancel();
+    $('go').textContent = 'Engage Travel Tracker'; $('go').classList.remove('on');
+    if ($('dot').className !== 'err') setStatus('Tracker off');
+  }
+
+  $('go').onclick = () => watchId == null ? start() : stop();
+  $('replay').onclick = () => { if (lastSpeech) { const m = muted; muted = false; speak(lastSpeech); muted = m; } };
+  $('mute').onclick = e => {
+    muted = !muted;
+    e.target.textContent = muted ? 'Voice off' : 'Voice on';
+    e.target.setAttribute('aria-pressed', muted);
+    if (muted) speechSynthesis.cancel();
+  };
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && watchId != null) keepAwake(); });
+  if ('speechSynthesis' in window) speechSynthesis.getVoices();
+  renderLog();
+})();
+</script>
+</body>
+</html>
